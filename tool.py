@@ -1,7 +1,6 @@
 import re
 import os
 import sys
-import time
 import traceback
 import tempfile
 import tkinter as tk
@@ -306,10 +305,6 @@ def tool1_extract_and_check(log_widget, file_a=None, file_b=None):
         err_msg = f"运行出错：{str(e)}\n{traceback.format_exc()}"
         log(f"❌ 出错了！详细信息：\n{err_msg}", log_widget)
         messagebox.showerror("错误", f"运行出错，程序不会退出，请查看日志：\n{str(e)}")
-        for i in range(60, 0, -1):
-            log(f"等待 {i} 秒后继续操作...", log_widget)
-            time.sleep(1)
-        log("已恢复，可继续操作", log_widget)
 
 # ==================== 工具2：生成抵扣模板 ====================
 def tool2_build_template(log_widget, file_a=None, file_b=None, file_c=None):
@@ -477,10 +472,6 @@ def tool2_build_template(log_widget, file_a=None, file_b=None, file_c=None):
         err_msg = f"运行出错：{str(e)}\n{traceback.format_exc()}"
         log(f"❌ 出错了！详细信息：\n{err_msg}", log_widget)
         messagebox.showerror("错误", f"运行出错，程序不会退出，请查看日志：\n{str(e)}")
-        for i in range(60, 0, -1):
-            log(f"等待 {i} 秒后继续操作...", log_widget)
-            time.sleep(1)
-        log("已恢复，可继续操作", log_widget)
 
 # ==================== 分区域拖拽（A/B/C 各绑一个文件） ====================
 def bind_zone_drop(widget, slot_key, path_state, text_label, log_widget):
