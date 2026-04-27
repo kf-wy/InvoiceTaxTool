@@ -1,0 +1,13 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build
+build/
+dist/
+*.spec
+
+# 澶ф枃浠惰蛋 Release 闄勪欢锛屼笉杩涘叆 Git 鍘嗗彶
+InvoiceTaxTool.exe
