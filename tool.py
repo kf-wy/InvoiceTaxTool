@@ -357,27 +357,17 @@ def tool2_build_template(log_widget, file_a=None, file_b=None, file_c=None):
         # 兼容加载
         wb_a = load_workbook_compat(a)
         ws_a = wb_a.active
-        col = None
-        for i in range(1,11):
-            for j in range(1,30):
-                if "摘要" in str(ws_a.cell(i,j).value or ""):
-                    col = j
-                    log(f"✅ 找到摘要列：第{i}行，第{j}列", log_widget)
-                    break
-            if col:
-                break
-        if not col:
-            log("❌ 未找到摘要列", log_widget)
-            messagebox.showerror("错误", "未找到摘要列")
-            return
+        # 功能二：发票号固定取自 A 表 E 列（与功能一「提取发票号」生成列一致，一般为摘要右侧一列）
+        col = 5
+        log("✅ A 表从 E 列读取发票号（自第 9 行至倒数第 2 行有效数据区）", log_widget)
 
-        log("🔧 提取发票号...", log_widget)
+        log("🔧 从 E 列提取发票号并与 B 表匹配...", log_widget)
         invs = []
         end = ws_a.max_row - 2
-        for r in range(9, end+1):
-            s = str(ws_a.cell(r, col).value or "")
+        for r in range(9, end + 1):
+            s = str(ws_a.cell(r, col).value or "").strip()
             for n in re.findall(r"\d+", s):
-                if 15 <= len(n) <=30:
+                if 15 <= len(n) <= 30:
                     invs.append(n)
                     break
 
