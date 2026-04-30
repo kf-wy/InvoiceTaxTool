@@ -534,7 +534,8 @@ def main():
     root = TkinterDnD.Tk()  # 支持拖拽的窗口
     root.title("发票抵扣工具集")
     root.geometry("800x820")
-    root.resizable(False, False)
+    root.minsize(720, 620)
+    root.resizable(True, True)
     root.configure(bg=BG_COLOR)
 
     path_state = {"a": None, "b": None, "c": None}
@@ -543,7 +544,7 @@ def main():
     log_text = scrolledtext.ScrolledText(
         root,
         width=85,
-        height=16,
+        height=12,
         font=("Consolas", 10),
         bg="white",
         fg="#333333",
@@ -557,19 +558,28 @@ def main():
         root, text="📋 发票处理工具", font=("微软雅黑", 28, "bold"), fg=BLUE, bg=BG_COLOR
     ).pack(pady=16)
 
-    tk.Label(
+    hint_label = tk.Label(
         root,
-        text="💡 将文件分别拖到 A / B / C 区（每次一个）；再点下方对应按钮处理。也可不拖拽，直接点按钮选文件。",
+        text="💡 将文件分别拖到 A / B / C 区（每次一个）；再点下方对应按钮处理。也可不拖拽，直接点按钮选文件。可拖动窗口边缘调整大小。",
         font=("微软雅黑", 9),
         fg="#666666",
         bg=BG_COLOR,
-        wraplength=760,
+        wraplength=752,
         justify="center",
-    ).pack(pady=(0, 8))
+    )
+    hint_label.pack(pady=(0, 8))
+
+    def _sync_hint_wrap(event):
+        if event.widget is root:
+            w = root.winfo_width()
+            if w > 1:
+                hint_label.config(wraplength=max(360, w - 48))
+
+    root.bind("<Configure>", _sync_hint_wrap)
 
     # 拖放区：A | B
     row_ab = tk.Frame(root, bg=BG_COLOR)
-    row_ab.pack(pady=8)
+    row_ab.pack(pady=8, fill=tk.X, padx=8)
     zone_a = make_drop_zone(
         row_ab,
         "A 区",
@@ -661,17 +671,19 @@ def main():
     btn2.bind("<Enter>", on_btn2_enter)
     btn2.bind("<Leave>", on_btn2_leave)
 
-    tk.Label(root, text="📜 运行日志", font=("微软雅黑", 12), fg=BLUE, bg=BG_COLOR).pack()
-    log_text.pack(pady=10)
+    tk.Label(root, text="📜 运行日志", font=("微软雅黑", 12), fg=BLUE, bg=BG_COLOR).pack(
+        pady=(8, 0)
+    )
+    log_text.pack(pady=(4, 10), padx=12, fill=tk.BOTH, expand=True)
     log_text.config(state=tk.DISABLED)
 
     tk.Label(
         root,
-        text="© 财务专用 | 全格式兼容 | 分区域拖拽 | 另存为后自动打开",
+        text="© 财务专用 | 全格式兼容 | 分区域拖拽 | 另存为后自动打开 | 可调整窗口大小",
         font=("微软雅黑", 11),
         fg=BLUE,
         bg=BG_COLOR,
-    ).pack(pady=5)
+    ).pack(pady=(0, 8))
 
     log("欢迎使用发票处理工具集！", log_text)
     log("使用方法：", log_text)
