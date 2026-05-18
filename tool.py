@@ -26,17 +26,44 @@ border = Border(left=thin, right=thin, top=thin, bottom=thin)
 def load_workbook_compat(file_path):
     """自动兼容.xlsx和.xls文件，自动转格式"""
     if file_path.lower().endswith('.xls'):
-        # 老版xls文件，自动转成临时xlsx处理
-        df = pd.read_excel(file_path)
-        # 创建临时文件
-        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
-            temp_path = tmp.name
-        df.to_excel(temp_path, index=False)
-        # 加载临时xlsx
-        wb = load_workbook(temp_path)
-        # 用完删临时文件
-        os.unlink(temp_path)
-        return wb
+        temp_path = None
+        try:
+            import win32com.client
+            import pythoncom
+            pythoncom.CoInitialize()
+            excel = win32com.client.DispatchEx("Excel.Application")
+            excel.Visible = False
+            excel.DisplayAlerts = False
+            try:
+                abs_path = os.path.abspath(file_path)
+                wb_com = excel.Workbooks.Open(abs_path)
+                with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+                    temp_path = tmp.name
+                # FileFormat=51 for xlOpenXMLWorkbook (.xlsx)
+                wb_com.SaveAs(os.path.abspath(temp_path), FileFormat=51)
+                wb_com.Close(False)
+            finally:
+                excel.Quit()
+                pythoncom.CoUninitialize()
+            
+            wb = load_workbook(temp_path)
+            os.unlink(temp_path)
+            return wb
+        except Exception as e:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+            # 如果没有安装Excel或COM调用失败，回退到pandas
+            # 使用 header=None 避免出现 "Unnamed:" 丑陋的表头
+            df = pd.read_excel(file_path, header=None)
+            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+                temp_path = tmp.name
+            df.to_excel(temp_path, index=False, header=False)
+            wb = load_workbook(temp_path)
+            os.unlink(temp_path)
+            return wb
     else:
         # 正常xlsx，直接加载
         return load_workbook(file_path)
@@ -69,6 +96,54 @@ def parse_drop_files(data):
                 files.append(data[i:j])
             i = j + 1
     return files
+
+
+# ==================== 方案一：摘要发票提取（功能一与功能二共用） ====================
+def build_invoice_map_scheme1(ws):
+    """
+    与功能一写入「提取发票号」相同的解析规则：
+    定位「摘要」列与表头行；左邻列与摘要列组合去重；摘要文本中取连续数字且长度>=15 的片段。
+    返回 ({行号: [号码,...]}, summary_col, header_row)；未找到摘要时为 ({}, None, None)。
+    """
+    summary_col = None
+    header_row = None
+    for row in ws.iter_rows():
+        for cell in row:
+            val = str(cell.value or "").strip()
+            if "摘要" in val:
+                summary_col = cell.column
+                header_row = cell.row
+                break
+        if summary_col:
+            break
+    if not summary_col:
+        return {}, None, None
+    left_col = summary_col - 1
+    end_row = max(1, ws.max_row - 2)
+    invoice_map = {}
+    prev_left = None
+    prev_sum = None
+    for r in range(header_row + 1, end_row + 1):
+        left_val = str(ws.cell(r, left_col).value or "").strip()
+        sum_val = str(ws.cell(r, summary_col).value or "").strip()
+        if left_val == prev_left and sum_val == prev_sum:
+            continue
+        prev_left = left_val
+        prev_sum = sum_val
+        nums = re.findall(r"\d+", sum_val)
+        valid = [n for n in nums if len(n) >= 15]
+        if valid:
+            invoice_map[r] = valid
+    return invoice_map, summary_col, header_row
+
+
+def flatten_invoices_from_map(invoice_map):
+    """按行号自上而下展开；同一摘要行内多段号码全部保留，避免漏票。"""
+    invs = []
+    for r in sorted(invoice_map.keys()):
+        invs.extend(invoice_map[r])
+    return invs
+
 
 # ==================== 工具1：发票提取 + 税额核对 ====================
 def tool1_extract_and_check(log_widget, file_a=None, file_b=None):
@@ -106,45 +181,18 @@ def tool1_extract_and_check(log_widget, file_a=None, file_b=None):
         # 兼容加载
         wb = load_workbook_compat(file_a)
         ws = wb.active
-        summary_col = None
-        header_row = None
-        for row in ws.iter_rows():
-            for cell in row:
-                val = str(cell.value or "").strip()
-                if "摘要" in val:
-                    summary_col = cell.column
-                    header_row = cell.row
-                    log(f"✅ 识别摘要列：第{header_row}行 第{summary_col}列", log_widget)
-                    break
-            if summary_col:
-                break
+        invoice_map, summary_col, header_row = build_invoice_map_scheme1(ws)
         if not summary_col:
             log("❌ 未找到【摘要】列", log_widget)
             messagebox.showerror("错误", "未找到【摘要】列")
             return
+        log(f"✅ 识别摘要列：第{header_row}行 第{summary_col}列", log_widget)
 
         left_col = summary_col - 1
         target_col = summary_col + 1
         ws.insert_cols(target_col)
         ws.cell(row=header_row, column=target_col).value = "提取发票号"
         ws.column_dimensions[ws.cell(1, target_col).column_letter].width = 25
-
-        invoice_map = {}
-        max_row = ws.max_row
-        prev_left = None
-        prev_sum = None
-        end_row = max_row - 2
-        for r in range(header_row + 1, end_row + 1):
-            left_val = str(ws.cell(r, left_col).value or "").strip()
-            sum_val = str(ws.cell(r, summary_col).value or "").strip()
-            if left_val == prev_left and sum_val == prev_sum:
-                continue
-            prev_left = left_val
-            prev_sum = sum_val
-            nums = re.findall(r"\d+", sum_val)
-            valid = [n for n in nums if len(n) >= 15]
-            if valid:
-                invoice_map[r] = valid
 
         for old_row in sorted(invoice_map.keys(), reverse=True):
             invs = invoice_map[old_row]
@@ -357,19 +405,59 @@ def tool2_build_template(log_widget, file_a=None, file_b=None, file_c=None):
         # 兼容加载
         wb_a = load_workbook_compat(a)
         ws_a = wb_a.active
-        # 功能二：发票号固定取自 A 表 E 列（与功能一「提取发票号」生成列一致，一般为摘要右侧一列）
-        col = 5
-        log("✅ A 表从 E 列读取发票号（自第 9 行至倒数第 2 行有效数据区）", log_widget)
-
-        log("🔧 从 E 列提取发票号并与 B 表匹配...", log_widget)
-        invs = []
-        end = ws_a.max_row - 2
-        for r in range(9, end + 1):
-            s = str(ws_a.cell(r, col).value or "").strip()
-            for n in re.findall(r"\d+", s):
-                if 15 <= len(n) <= 30:
-                    invs.append(n)
+        end = max(1, ws_a.max_row - 2)
+        
+        # 1. 优先查找是否存在「提取发票号」列（工具一处理后的表）
+        inv_col = None
+        header_row = None
+        for i in range(1, min(21, ws_a.max_row + 1)):
+            for j in range(1, min(41, ws_a.max_column + 1)):
+                val = str(ws_a.cell(i, j).value or "").strip()
+                if "提取发票号" in val:
+                    header_row = i
+                    inv_col = j
                     break
+            if inv_col:
+                break
+                
+        invs = []
+        if inv_col is not None:
+            log(f"✅ A 表：表头包含「提取发票号」（第 {inv_col} 列），直接读取该列发票", log_widget)
+            for r in range(header_row + 1, end + 1):
+                s = str(ws_a.cell(r, inv_col).value or "").strip()
+                for n in re.findall(r"\d+", s):
+                    if 15 <= len(n) <= 30:
+                        invs.append(n)
+                        break  # 每行取第一个匹配的即可，因为“提取发票号”列应该已经是单行单票了
+            log(f"🔧 从「提取发票号」列解析得到 {len(invs)} 条发票号记录", log_widget)
+        else:
+            # 2. 回退到方案一（从摘要提取）
+            invoice_map, summary_col, _hr = build_invoice_map_scheme1(ws_a)
+            if invoice_map:
+                log(
+                    "✅ A 表：未找到「提取发票号」列，采用方案一从「摘要」提取（左邻列+摘要去重）",
+                    log_widget,
+                )
+                invs = flatten_invoices_from_map(invoice_map)
+                log(f"🔧 摘要解析得到 {len(invs)} 条发票号记录", log_widget)
+            
+            # 3. 再兜底从 D 列读取
+            if not invs:
+                inv_col_compat = 4
+                log(
+                    "⚠️ 未找到「提取发票号」列或「摘要」列解析失败，兼容从 D 列第 9 行起读取",
+                    log_widget,
+                )
+                for r in range(9, end + 1):
+                    s = str(ws_a.cell(r, inv_col_compat).value or "").strip()
+                    for n in re.findall(r"\d+", s):
+                        if 15 <= len(n) <= 30:
+                            invs.append(n)
+                            break
+                if invs:
+                    log(f"🔧 D 列补充得到 {len(invs)} 条", log_widget)
+
+        log("🔧 与 B 表匹配并填模板...", log_widget)
 
         if not invs:
             log("❌ 未提取到任何发票号", log_widget)
@@ -463,6 +551,160 @@ def tool2_build_template(log_widget, file_a=None, file_b=None, file_c=None):
         log(f"❌ 出错了！详细信息：\n{err_msg}", log_widget)
         messagebox.showerror("错误", f"运行出错，程序不会退出，请查看日志：\n{str(e)}")
 
+# ==================== 工具3：自定义发票表生成抵扣模板 ====================
+def tool3_build_template_from_custom(log_widget, file_a=None, file_b=None, file_c=None):
+    try:
+        log("==================================================", log_widget)
+        log("    功能3：自定义发票表生成抵扣模板", log_widget)
+        log("    直接从 A 表第一列（A列）第 2 行起提取发票", log_widget)
+        log("==================================================", log_widget)
+        log("", log_widget)
+
+        if not file_a:
+            log("📂 请选择【A表：自定义发票表.xlsx】", log_widget)
+            a = filedialog.askopenfilename(
+                title="A表：自定义发票表", 
+                filetypes=[("Excel文件", "*.xlsx;*.xls")]
+            )
+        else:
+            a = file_a
+        if not a:
+            log("❌ 未选择A表", log_widget)
+            return
+        
+        if not file_b:
+            log("📂 请选择【B表：抵扣勾选增值税发票信息.xlsx】", log_widget)
+            b = filedialog.askopenfilename(
+                title="B表：抵扣发票信息", 
+                filetypes=[("Excel文件", "*.xlsx;*.xls")]
+            )
+        else:
+            b = file_b
+        if not b:
+            log("❌ 未选择B表", log_widget)
+            return
+        
+        if not file_c:
+            log("📂 请选择【C表：进项税发票抵扣勾选导入模版.xlsx】", log_widget)
+            c = filedialog.askopenfilename(
+                title="C表：导入模板", 
+                filetypes=[("Excel文件", "*.xlsx;*.xls")]
+            )
+        else:
+            c = file_c
+        if not c:
+            log("❌ 未选择C表", log_widget)
+            return
+
+        log(f"✅ 已选择文件：\n  A表: {a}\n  B表: {b}\n  C表: {c}", log_widget)
+
+        wb_a = load_workbook_compat(a)
+        ws_a = wb_a.active
+        end = ws_a.max_row
+        
+        invs = []
+        log("✅ A 表从 A 列（第1列）提取发票号（自第 2 行开始）", log_widget)
+        for r in range(2, end + 1):
+            s = str(ws_a.cell(r, 1).value or "").strip()
+            nums = re.findall(r"\d+", s)
+            for n in nums:
+                if 15 <= len(n) <= 30:
+                    invs.append(n)
+                    break
+        log(f"🔧 解析得到 {len(invs)} 条发票号记录", log_widget)
+
+        log("🔧 与 B 表匹配并填模板...", log_widget)
+
+        if not invs:
+            log("❌ 未提取到任何发票号", log_widget)
+            messagebox.showwarning("提示", "未提取到发票")
+            return
+
+        log("🔧 加载B表数据...", log_widget)
+        wb_b = load_workbook_compat(b)
+        ws_b = wb_b.active
+        mp = {}
+        for r in range(2, ws_b.max_row+1):
+            k = str(ws_b.cell(r,3).value or "").strip()
+            if k:
+                mp[k] = {
+                    "数电发票号码": ws_b.cell(r,2).value,
+                    "发票代码": ws_b.cell(r,4).value,
+                    "开票日期*": ws_b.cell(r,6).value,
+                    "金额*": ws_b.cell(r,7).value,
+                    "票面税额*": ws_b.cell(r,8).value,
+                    "有效抵扣税额*": ws_b.cell(r,9).value,
+                    "购货方识别号*": ws_b.cell(r,10).value,
+                    "销售方名称": ws_b.cell(r,11).value,
+                    "销售方识别号*": ws_b.cell(r,12).value,
+                    "发票来源": ws_b.cell(r,13).value,
+                    "发票类型*": ws_b.cell(r,14).value,
+                }
+        log(f"✅ B表共加载 {len(mp)} 条发票信息", log_widget)
+
+        log("🔧 填充模板数据...", log_widget)
+        wb_c = load_workbook_compat(c)
+        ws_c = wb_c.active
+        cnt = Counter([str(x).strip() for x in invs])
+        row = 2
+        match_count = 0
+
+        for v in invs:
+            vs = str(v).strip()
+            ws_c.cell(row,1,"是")
+            cell = ws_c.cell(row,2,vs)
+
+            if len(vs)!=20:
+                cell.fill = RED_CELL
+                cell.comment = Comment("错误","系统")
+            if cnt[vs]>=2:
+                cell.fill = YELLOW
+                cell.comment = Comment("重复发票","系统")
+
+            if vs in mp:
+                d = mp[vs]
+                ws_c.cell(row,3, d["发票代码"])
+                ws_c.cell(row,5, d["开票日期*"])
+                ws_c.cell(row,6, d["金额*"])
+                ws_c.cell(row,7, d["票面税额*"])
+                ws_c.cell(row,8, d["有效抵扣税额*"])
+                ws_c.cell(row,9, d["购货方识别号*"])
+                ws_c.cell(row,10, d["销售方名称"])
+                ws_c.cell(row,11, d["销售方识别号*"])
+                ws_c.cell(row,12, d["发票来源"])
+                ws_c.cell(row,13, d["发票类型*"])
+                match_count +=1
+
+            for cc in range(1,14):
+                ws_c.cell(row,cc).border = border
+            row +=1
+
+        log(f"✅ 模板填充完成：成功匹配 {match_count} 条", log_widget)
+
+        default_name = "✅已生成_自定义进项税抵扣模板.xlsx"
+        initial_dir = os.path.dirname(c) if c else os.getcwd()
+        out = filedialog.asksaveasfilename(
+            title="保存抵扣勾选模板",
+            initialdir=initial_dir,
+            initialfile=default_name,
+            defaultextension=".xlsx",
+            filetypes=[("Excel 工作簿", "*.xlsx"), ("所有文件", "*.*")],
+        )
+        if not out:
+            log("❌ 已取消保存，文件未写入磁盘", log_widget)
+            return
+        wb_c.save(out)
+        log("\n🎉 全部处理完成！", log_widget)
+        log(f"📁 已保存：{out}", log_widget)
+        log("🔍 正在自动打开文件...", log_widget)
+        os.startfile(out)
+        messagebox.showinfo("完成", f"处理完成！\n文件已保存并打开：\n{out}")
+
+    except Exception as e:
+        err_msg = f"运行出错：{str(e)}\n{traceback.format_exc()}"
+        log(f"❌ 出错了！详细信息：\n{err_msg}", log_widget)
+        messagebox.showerror("错误", f"运行出错，程序不会退出，请查看日志：\n{str(e)}")
+
 # ==================== 分区域拖拽（A/B/C 各绑一个文件） ====================
 def bind_zone_drop(widget, slot_key, path_state, text_label, log_widget):
     """每次拖入动作只更新对应分区；多文件时取第一个并提示。"""
@@ -488,7 +730,7 @@ def bind_zone_drop(widget, slot_key, path_state, text_label, log_widget):
     widget.dnd_bind("<<Drop>>", on_drop)
 
 
-def make_drop_zone(parent, title, hint, slot_key, path_state, log_widget, width_chars=28):
+def make_drop_zone(parent, title, hint, slot_key, path_state, log_widget):
     """创建可拖放的单文件区域，返回 Frame。"""
     fr = tk.Frame(
         parent,
@@ -497,7 +739,8 @@ def make_drop_zone(parent, title, hint, slot_key, path_state, log_widget, width_
         highlightthickness=2,
         bd=0,
     )
-    tk.Label(fr, text=title, font=("微软雅黑", 11, "bold"), bg="#e8eef7", fg=BLUE).pack(
+    title_lbl = tk.Label(fr, text=title, font=("微软雅黑", 11, "bold"), bg="#e8eef7", fg=BLUE)
+    title_lbl.pack(
         pady=(10, 4)
     )
     name_lbl = tk.Label(
@@ -506,15 +749,18 @@ def make_drop_zone(parent, title, hint, slot_key, path_state, log_widget, width_
         font=("微软雅黑", 9),
         bg="white",
         fg="#666666",
-        width=width_chars,
-        anchor="w",
+        anchor="center",
         padx=8,
         pady=10,
     )
-    name_lbl.pack(fill=tk.X, padx=10, pady=4)
-    tk.Label(fr, text=hint, font=("微软雅黑", 8), bg="#e8eef7", fg="#888888").pack(
+    name_lbl.pack(fill=tk.X, expand=True, padx=10, pady=4)
+    hint_lbl = tk.Label(fr, text=hint, font=("微软雅黑", 8), bg="#e8eef7", fg="#888888")
+    hint_lbl.pack(
         pady=(0, 10)
     )
+    fr.title_lbl = title_lbl
+    fr.name_lbl = name_lbl
+    fr.hint_lbl = hint_lbl
     bind_zone_drop(fr, slot_key, path_state, name_lbl, log_widget)
     return fr
 
@@ -523,8 +769,8 @@ def make_drop_zone(parent, title, hint, slot_key, path_state, log_widget, width_
 def main():
     root = TkinterDnD.Tk()  # 支持拖拽的窗口
     root.title("发票抵扣工具集")
-    root.geometry("800x820")
-    root.minsize(720, 620)
+    root.geometry("800x900")
+    root.minsize(560, 520)
     root.resizable(True, True)
     root.configure(bg=BG_COLOR)
 
@@ -544,9 +790,10 @@ def main():
     log_text.config(state=tk.DISABLED)
 
     # 顶部标题
-    tk.Label(
+    title_label = tk.Label(
         root, text="📋 发票处理工具", font=("微软雅黑", 28, "bold"), fg=BLUE, bg=BG_COLOR
-    ).pack(pady=16)
+    )
+    title_label.pack(pady=16)
 
     hint_label = tk.Label(
         root,
@@ -559,27 +806,18 @@ def main():
     )
     hint_label.pack(pady=(0, 8))
 
-    def _sync_hint_wrap(event):
-        if event.widget is root:
-            w = root.winfo_width()
-            if w > 1:
-                hint_label.config(wraplength=max(360, w - 48))
-
-    root.bind("<Configure>", _sync_hint_wrap)
-
     # 拖放区：A | B
     row_ab = tk.Frame(root, bg=BG_COLOR)
     row_ab.pack(pady=8, fill=tk.X, padx=8)
     zone_a = make_drop_zone(
         row_ab,
         "A 区",
-        "原始账务表",
+        "原始账务表/自定义发票表",
         "a",
         path_state,
         log_text,
-        width_chars=32,
     )
-    zone_a.pack(side=tk.LEFT, padx=10, ipadx=6, ipady=4)
+    zone_a.pack(side=tk.LEFT, padx=10, ipadx=6, ipady=4, expand=True, fill=tk.X)
     zone_b = make_drop_zone(
         row_ab,
         "B 区",
@@ -587,19 +825,17 @@ def main():
         "b",
         path_state,
         log_text,
-        width_chars=32,
     )
-    zone_b.pack(side=tk.LEFT, padx=10, ipadx=6, ipady=4)
+    zone_b.pack(side=tk.LEFT, padx=10, ipadx=6, ipady=4, expand=True, fill=tk.X)
 
     # C 区（仅工具2需要；工具1忽略）
     zone_c = make_drop_zone(
         root,
         "C 区",
-        "工具2：进项税抵扣勾选导入模版（仅功能2需要）",
+        "工具2/3：进项税抵扣勾选导入模版",
         "c",
         path_state,
         log_text,
-        width_chars=72,
     )
     zone_c.pack(pady=6, padx=20, ipadx=8, ipady=2, fill=tk.X)
 
@@ -661,23 +897,82 @@ def main():
     btn2.bind("<Enter>", on_btn2_enter)
     btn2.bind("<Leave>", on_btn2_leave)
 
-    tk.Label(root, text="📜 运行日志", font=("微软雅黑", 12), fg=BLUE, bg=BG_COLOR).pack(
+    # 按钮3
+    def on_btn3_enter(e):
+        btn3.config(bg=BLUE, fg="white")
+
+    def on_btn3_leave(e):
+        btn3.config(bg="white", fg=BLUE)
+
+    btn3 = tk.Button(
+        btn_frame,
+        text="📋  3. 自定义发票表生成模板",
+        font=("微软雅黑", 16),
+        width=40,
+        height=2,
+        bg="white",
+        fg=BLUE,
+        bd=2,
+        relief="flat",
+        highlightbackground=BLUE,
+        highlightthickness=2,
+        command=lambda: tool3_build_template_from_custom(
+            log_text, path_state["a"], path_state["b"], path_state["c"]
+        ),
+    )
+    btn3.pack(pady=10)
+    btn3.bind("<Enter>", on_btn3_enter)
+    btn3.bind("<Leave>", on_btn3_leave)
+
+    log_label = tk.Label(root, text="📜 运行日志", font=("微软雅黑", 12), fg=BLUE, bg=BG_COLOR)
+    log_label.pack(
         pady=(8, 0)
     )
     log_text.pack(pady=(4, 10), padx=12, fill=tk.BOTH, expand=True)
     log_text.config(state=tk.DISABLED)
 
-    tk.Label(
+    footer_label = tk.Label(
         root,
         text="© 财务专用 | 全格式兼容 | 分区域拖拽 | 另存为后自动打开 | 可调整窗口大小",
         font=("微软雅黑", 11),
         fg=BLUE,
         bg=BG_COLOR,
-    ).pack(pady=(0, 8))
+    )
+    footer_label.pack(pady=(0, 8))
+
+    def _apply_window_scale(event=None):
+        if event is not None and event.widget is not root:
+            return
+        w = max(root.winfo_width(), 1)
+        h = max(root.winfo_height(), 1)
+        scale = max(0.68, min(1.2, min(w / 800, h / 900)))
+
+        title_label.config(font=("微软雅黑", max(18, int(28 * scale)), "bold"))
+        hint_label.config(
+            font=("微软雅黑", max(8, int(9 * scale))),
+            wraplength=max(320, w - int(48 * scale)),
+        )
+        log_label.config(font=("微软雅黑", max(9, int(12 * scale))))
+        footer_label.config(font=("微软雅黑", max(8, int(11 * scale))))
+        log_text.config(font=("Consolas", max(8, int(10 * scale))))
+
+        for zone in (zone_a, zone_b, zone_c):
+            zone.title_lbl.config(font=("微软雅黑", max(8, int(11 * scale)), "bold"))
+            zone.name_lbl.config(font=("微软雅黑", max(8, int(9 * scale))))
+            zone.hint_lbl.config(font=("微软雅黑", max(7, int(8 * scale))))
+
+        btn_font = ("微软雅黑", max(10, int(16 * scale)))
+        btn_width = max(28, int(40 * scale))
+        btn_height = 1 if scale < 0.82 else 2
+        for btn in (btn1, btn2, btn3):
+            btn.config(font=btn_font, width=btn_width, height=btn_height)
+
+    root.bind("<Configure>", _apply_window_scale)
+    root.after(100, _apply_window_scale)
 
     log("欢迎使用发票处理工具集！", log_text)
     log("使用方法：", log_text)
-    log("  👉 将 Excel 拖到 A/B（功能1）或 A/B/C（功能2），每次拖入一个文件。", log_text)
+    log("  👉 将 Excel 拖到 A/B 或 A/B/C，每次拖入一个文件。", log_text)
     log("  👉 点对应按钮开始处理；未拖入的区域会在处理时弹出文件选择框。", log_text)
     log("  👉 支持 .xlsx 与 .xls；处理结束后使用系统「另存为」选择路径与文件名，保存后自动打开。", log_text)
     log("-" * 60, log_text)
